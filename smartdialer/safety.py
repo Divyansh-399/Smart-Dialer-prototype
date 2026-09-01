@@ -28,7 +28,10 @@ class SafetyController:
         elif request.mode == "progressive":
             decision = SafetyDecision(request.requested, min(request.requested, request.available_agents), "progressive capacity")
         else:
-            approved = min(request.requested, request.available_agents, self.config.max_concurrent_calls)
+            # Current agents and explicitly bound, imminent release slots are both
+            # deterministic connection tokens; estimates alone are never tokens.
+            protected_capacity = request.available_agents + request.protected_release_slots
+            approved = min(request.requested, protected_capacity, self.config.max_concurrent_calls)
             decision = SafetyDecision(request.requested, approved, "predictive request approved" if approved == request.requested else "reduced to protected agent capacity", approved < request.requested)
         self.decisions.append(decision)
         return decision

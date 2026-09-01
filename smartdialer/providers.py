@@ -15,6 +15,8 @@ class MockTelecomProvider:
     answer_rate: float = 0.32
     breaker: CircuitBreaker = field(default_factory=CircuitBreaker)
     status_by_call: dict[str, list[ProviderEvent]] = field(default_factory=dict)
+    setup_turns: int = 0
+    talk_turns: int = 0
 
     def healthy(self, turn: int) -> bool:
         return self.breaker.available(turn)
@@ -23,7 +25,7 @@ class MockTelecomProvider:
         if not self.healthy(turn):
             return [self._event(call.id, CallState.FAILED)]
         outcome = self.outcomes.pop(0) if self.outcomes else self._random_outcome()
-        events = [self._event(call.id, state, index) for index, state in enumerate(self._states_for(outcome))]
+        events = self._events_for(call.id, outcome, turn)
         self.status_by_call[call.id] = events
         if outcome == Outcome.FAILED:
             self.breaker.failure(turn)
@@ -34,8 +36,20 @@ class MockTelecomProvider:
     def status(self, call_id: str) -> list[ProviderEvent]:
         return self.status_by_call.get(call_id, [])
 
-    def _event(self, call_id: str, state: CallState, index: int = 0) -> ProviderEvent:
-        return ProviderEvent(f"{self.name}:{call_id}:{state.value}:{index}", call_id, state, self.name)
+    def _event(self, call_id: str, state: CallState, index: int = 0, due_turn: int = 0) -> ProviderEvent:
+        return ProviderEvent(f"{self.name}:{call_id}:{state.value}:{index}", call_id, state, self.name, due_turn)
+
+    def _events_for(self, call_id: str, outcome: Outcome, turn: int) -> list[ProviderEvent]:
+        if outcome == Outcome.ANSWERED:
+            answer_at = turn + self.setup_turns
+            return [self._event(call_id, CallState.RINGING, 0, turn),
+                    self._event(call_id, CallState.ANSWERED, 1, answer_at),
+                    self._event(call_id, CallState.CONNECTED, 2, answer_at),
+                    self._event(call_id, CallState.COMPLETED, 3, answer_at + self.talk_turns)]
+        if outcome == Outcome.FAILED:
+            return [self._event(call_id, CallState.FAILED, 0, turn)]
+        return [self._event(call_id, CallState.RINGING, 0, turn),
+                self._event(call_id, CallState.COMPLETED, 1, turn + self.setup_turns)]
 
     def _states_for(self, outcome: Outcome) -> list[CallState]:
         if outcome == Outcome.ANSWERED:
@@ -58,8 +72,8 @@ class MockTelecomProvider:
 
 
 class ReliableMockProvider(MockTelecomProvider):
-    def __init__(self, name: str = "ProviderA") -> None:
-        super().__init__(name=name, failure_rate=0.01, answer_rate=0.35)
+    def __init__(self, name: str = "ProviderA", **kwargs: object) -> None:
+        super().__init__(name=name, failure_rate=0.01, answer_rate=0.35, **kwargs)
 
 
 class ChaoticMockProvider(MockTelecomProvider):

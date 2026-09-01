@@ -9,7 +9,7 @@ Requires Python 3.10+.
 ```bash
 python -m unittest discover -s tests -v
 python -m smartdialer.simulation --mode progressive --scenario A --leads 100 --agents 4
-python -m smartdialer.simulation --mode predictive --scenario C --leads 300 --agents 8
+python -m smartdialer.simulation --mode predictive --scenario C --leads 300 --agents 8 --drop-agents-at-turn 3 --drop-agent-count 2 --inject-abandon-at-turn 5
 python scripts/load_test.py
 ```
 
@@ -20,10 +20,10 @@ The optional static visual demo remains available by opening [index.html](index.
 - Progressive and predictive pacing modes
 - A separate Safety Controller that alone authorizes allocation
 - Explicit agent and call state machines
-- Atomic agent + borrower reservation using a repository lock
+- Atomic agent + borrower reservation using an in-memory lock and SQLite transactional store
 - Idempotent provider event processing and terminal-state protection
 - Reliable Provider A and duplicate/out-of-order Provider B mocks
-- Circuit breaker provider isolation, restart recovery, simulations, tests, and a load smoke test
+- Circuit breaker provider isolation, retry/failover, restart recovery, timed simulations, tests, and a load smoke test
 - Architecture decisions and scale plan in [docs/architecture.md](docs/architecture.md)
 
 ## Safety boundary
@@ -32,7 +32,7 @@ The optional static visual demo remains available by opening [index.html](index.
 Campaign -> Pacing Engine -> Safety Controller -> Call Allocator -> Telecom Provider
 ```
 
-The pacer only produces a requested count. It has no provider reference. The Safety Controller can approve, reduce, reject, or force progressive fallback. In this prototype every initiated call holds a real agent reservation (a connection token), so predictive requests above protected capacity are reduced. This sacrifices aggressive oversubscription while making the no-abandon invariant deterministic.
+The pacer only produces a requested count. It has no provider reference. The Safety Controller can approve, reduce, reject, or force progressive fallback. Every initiated call holds a real agent reservation (a connection token), or an explicitly bound release slot whose call completion is scheduled before the answer event. This permits safe dial-ahead without prediction alone becoming a safety guarantee.
 
 ## Design notes
 

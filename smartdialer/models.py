@@ -59,6 +59,8 @@ class Agent:
     available: bool = True
     state: AgentState = AgentState.AVAILABLE
     reserved_call_id: Optional[str] = None
+    future_call_id: Optional[str] = None
+    release_turn: int = 0
 
     def __post_init__(self) -> None:
         if not self.available and self.state == AgentState.AVAILABLE:
@@ -77,6 +79,7 @@ class CallRecord:
     state: CallState = CallState.QUEUED
     event_ids: set[str] = field(default_factory=set)
     history: list[str] = field(default_factory=lambda: [CallState.QUEUED.value])
+    scheduled_turn: int = 0
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,7 @@ class ProviderEvent:
     call_id: str
     state: CallState
     provider: str
+    due_turn: int = 0
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,7 @@ class PacingRequest:
     available_agents: int
     ringing_calls: int
     provider_healthy: bool
+    protected_release_slots: int = 0
 
 
 @dataclass(frozen=True)
@@ -114,3 +119,5 @@ class CampaignConfig:
     end_hour: int = 20
     retry_limit: int = 1
     reservation_ttl_turns: int = 2
+    predictive_lookahead_turns: int = 1
+    turn_seconds: int = 30

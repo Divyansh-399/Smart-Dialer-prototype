@@ -13,7 +13,7 @@ flowchart LR
   E --> R
 ```
 
-The prototype uses Python and the standard library. A single lock-protected repository is deliberately enough to demonstrate the important invariant: create the call, reserve one eligible borrower, and reserve one available agent as one atomic operation. It makes the prototype easy to run and test. In production, replace the lock with a database transaction using conditional `UPDATE ... WHERE state = 'available'`, a row/version check, and a uniqueness constraint on active agent/lead reservations. The database is authoritative; cache is only a derived, discardable read model.
+The prototype uses Python and the standard library. `InMemoryRepository` demonstrates the invariant in one process; `SqliteReservationStore` demonstrates the same agent + borrower reservation in a durable `BEGIN IMMEDIATE` transaction across separate store instances. In production, use a database transaction with conditional `UPDATE ... WHERE state = 'available'`, a row/version check, and a uniqueness constraint on active agent/lead reservations. The database is authoritative; cache is only a derived, discardable read model.
 
 ## State machines
 
@@ -54,9 +54,9 @@ The processor accepts terminal `COMPLETED` safely from an in-flight state, becau
 
 ## Pacing and deterministic safety
 
-The pacer starts at 1.0 calls per available agent and adjusts its proposal by 0.25 based on observed abandonment and answer rate. It caps at 3.5x as a proposal, backs off at 75% of the abandon threshold, and returns to 1.0 when the threshold is crossed or answer rate collapses. It can use historical answer rate, current capacity, ringing calls, provider health, and recent results; the prototype exposes the conservative feedback pieces.
+The pacer starts at 1.0 calls per available agent and adjusts its proposal by 0.25 based on observed abandonment and answer rate. It caps at 3.5x as a proposal, backs off at 75% of the abandon threshold, and returns to 1.0 when the threshold is crossed or answer rate collapses. The simulator models setup time, talk time, and agent occupancy in 30-second turns; an agent has a known `release_turn` while connected.
 
-The Safety Controller independently checks provider health and abandon rate. It records each decision and may approve, reduce, reject, or fall back to progressive behavior. For an assignment prototype, its stronger rule is one connection token per initiated call: a request for 17 calls with 10 available agents is reduced to 10. This gets predictive *decisioning* and rapid safe feedback without accepting the compliance risk of a borrower answering without a guaranteed agent. A production extension could reserve highly confident imminent wrap-up slots, but must retain an equivalent durable token before dialing.
+The Safety Controller independently checks provider health and abandon rate. It records each decision and may approve, reduce, reject, or fall back to progressive behavior. A token is either an available agent or an already-bound, imminent agent release whose scheduled completion occurs before the provider's scheduled answer event. Thus a predictive call is allowed only when it has deterministic coverage, not merely a statistical forecast.
 
 ## Failure walkthroughs
 
@@ -65,14 +65,14 @@ The Safety Controller independently checks provider health and abandon rate. It 
 | Two workers race for one agent/borrower | The repository's atomic compare-and-set yields one winner. |
 | Worker crashes after initiation | On restart, `recover()` queries provider status first, processes any authoritative events, then cancels and releases only an unresolved reservation. |
 | Provider starts timing out | Circuit breaker marks it unhealthy; new requests are rejected if no provider is healthy. Existing calls are reconciled, not blindly retried. |
-| 40 of 100 agents go offline | Their state no longer counts as `AVAILABLE`; the next pacing turn is immediately reduced by Safety Controller capacity. |
+| 40 of 100 agents go offline | `mark_agents_unavailable()` immediately removes them from capacity and cancels only pre-connect calls bound to those agents. |
 | Duplicate or out-of-order events | Event IDs and terminal-state rules make them idempotent no-ops or safe terminal transitions. |
 
-Retries are only appropriate before a provider has accepted a call and must use an idempotency key. After an unknown initiation timeout, query the provider by that key rather than redialing a borrower.
+Definite pre-connect provider failures retry once through a different healthy provider. Unknown initiation timeouts must instead query the provider by idempotency key before any retry, so the borrower is never redialed blindly.
 
 ## Mock providers and validation
 
-Provider A is fast and reliable. Provider B has a higher failure rate and delivers duplicates/out-of-order events. Tests cover capacity, DNC/hours, concurrent reservation, event idempotency, worker recovery, provider outage, abandonment fallback, and pacing backoff. `scripts/load_test.py` is a reproducible 10,000-lead / 1,000-agent in-process smoke test, not a claims-of-production performance benchmark.
+Provider A is fast and reliable. Provider B has a higher failure rate and delivers duplicates/out-of-order events. Tests cover lifecycle preservation, capacity, DNC/hours, concurrent in-memory and SQLite reservations, retry/failover, agent drops, event idempotency, worker recovery, provider outage, and end-to-end abandonment fallback. `scripts/load_test.py` is a reproducible 10,000-lead / 1,000-agent in-process smoke test, not a claims-of-production performance benchmark.
 
 ## Scale plan
 
