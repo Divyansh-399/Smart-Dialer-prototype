@@ -43,3 +43,4 @@ Provider events carry an event ID. Duplicate event IDs are ignored; once a call 
 See [docs/architecture.md](docs/architecture.md) for the diagrams, failure walkthroughs, pacing explanation, scaling plan, and the short answer requested in the brief.
 For a direct checklist-to-file mapping for reviewers, see [docs/submission_answers.md](docs/submission_answers.md).
 The requested concise design response is in [docs/final_question_answer.md](docs/final_question_answer.md).
+The failure-case answers are also available as [a submission PDF](output/pdf/smartdialer_failure_case_answers.pdf).
