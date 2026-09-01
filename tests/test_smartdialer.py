@@ -1,71 +1,86 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import unittest
 
 from smartdialer.engine import DialerEngine
-from smartdialer.models import Agent, CampaignConfig, Lead, Outcome
+from smartdialer.models import Agent, CallRecord, CallState, CampaignConfig, Lead, Outcome, ProviderEvent
 from smartdialer.pacing import PredictivePacer
-from smartdialer.providers import MockTelecomProvider
-from smartdialer.safety import SafetyGuard
+from smartdialer.providers import ChaoticMockProvider, MockTelecomProvider
+from smartdialer.repository import InMemoryRepository
+from smartdialer.safety import SafetyController
 
 
 class SmartDialerTests(unittest.TestCase):
     def test_progressive_only_dials_free_agents(self):
         engine = self.engine(mode="progressive", agents=2)
-        results = engine.run_turn(self.leads(5), self.noon())
-        self.assertEqual(len(results), 2)
+        self.assertEqual(len(engine.run_turn(self.leads(5), self.noon())), 2)
 
-    def test_concurrency_cap_is_never_exceeded(self):
-        engine = self.engine(agents=8, cap=3)
-        engine.run_turn(self.leads(20), self.noon())
-        self.assertLessEqual(engine.max_seen_concurrent, 3)
+    def test_predictive_is_reduced_to_protected_agent_capacity(self):
+        engine = self.engine(agents=2)
+        engine.pacer.ratio = 3
+        self.assertEqual(len(engine.run_turn(self.leads(10), self.noon())), 2)
+        self.assertTrue(engine.safety.decisions[-1].fallback_to_progressive)
 
-    def test_dnc_is_not_dialed(self):
-        lead = Lead("x", "+1", dnc=True)
+    def test_dnc_and_hours_are_not_dialed(self):
         engine = self.engine()
-        engine.run_turn([lead], self.noon())
-        self.assertEqual(lead.attempts, 0)
-        self.assertEqual(engine.records[-1].outcome, Outcome.BLOCKED_DNC)
+        dnc, late = Lead("d", "+1", dnc=True), Lead("l", "+2")
+        engine.run_turn([dnc], self.noon())
+        engine.run_turn([late], datetime(2026, 1, 1, 2))
+        self.assertEqual((dnc.attempts, late.attempts), (0, 0))
+        self.assertIn(Outcome.BLOCKED_DNC, [record.outcome for record in engine.records])
+        self.assertIn(Outcome.BLOCKED_HOURS, [record.outcome for record in engine.records])
 
-    def test_outside_hours_is_not_dialed(self):
+    def test_duplicate_and_out_of_order_events_are_idempotent(self):
+        engine = self.engine(providers=[ChaoticMockProvider(outcomes=[Outcome.ANSWERED])])
+        call = engine.run_turn(self.leads(1), self.noon())[0]
+        self.assertEqual(call.state, CallState.COMPLETED)
+        self.assertEqual(call.history.count("answered"), 0)
+        self.assertEqual(len(engine.records), 1)
+
+    def test_terminal_event_blocks_late_answer(self):
         engine = self.engine()
-        lead = Lead("x", "+1")
-        engine.run_turn([lead], datetime(2026, 1, 1, 2))
-        self.assertEqual(lead.attempts, 0)
-        self.assertEqual(engine.records[-1].outcome, Outcome.BLOCKED_HOURS)
+        call = CallRecord("x", provider="mock", state=CallState.INITIATED)
+        engine.repository.add_leads([Lead("x", "+1")])
+        self.assertTrue(engine.repository.reserve("x", call))
+        engine.process_event(ProviderEvent("done", call.id, CallState.COMPLETED, "mock"))
+        self.assertFalse(engine.process_event(ProviderEvent("late", call.id, CallState.ANSWERED, "mock")))
+        self.assertEqual(call.state, CallState.COMPLETED)
 
-    def test_attempt_cap_prevents_redial(self):
-        engine = self.engine()
-        lead = Lead("x", "+1", attempts=3)
-        engine.run_turn([lead], self.noon())
-        self.assertEqual(lead.attempts, 3)
+    def test_atomic_reservation_allows_one_winner(self):
+        repo = InMemoryRepository([Agent("a")], [Lead("l", "+1")])
+        calls = [CallRecord("l"), CallRecord("l")]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            wins = list(pool.map(lambda call: repo.reserve("l", call), calls))
+        self.assertEqual(sum(wins), 1)
 
-    def test_pacer_climbs_when_safe(self):
-        pacer = PredictivePacer()
-        self.assertGreater(pacer.update(0, .03), 1)
-
-    def test_pacer_backs_off_at_cap(self):
-        pacer = PredictivePacer(ratio=3.5)
-        self.assertEqual(pacer.update(.03, .03), 1)
-
-    def test_emergency_brake_falls_back_to_progressive(self):
-        guard = SafetyGuard(CampaignConfig(max_abandon_rate=.03))
-        self.assertEqual(guard.safe_target(10, 3, .03), 3)
-
-    def test_provider_retries_infrastructure_failure(self):
-        provider = MockTelecomProvider("mock", outcomes=[Outcome.FAILED, Outcome.ANSWERED])
+    def test_worker_recovery_reconciles_provider_status(self):
+        provider = MockTelecomProvider("mock")
         engine = self.engine(providers=[provider])
-        result = engine.run_turn(self.leads(1), self.noon())[0]
-        self.assertEqual(result.outcome, Outcome.ANSWERED)
-        self.assertEqual(result.attempts, 2)
+        call = CallRecord("x", provider="mock", state=CallState.INITIATED)
+        engine.repository.add_leads([Lead("x", "+1")])
+        engine.repository.reserve("x", call)
+        provider.status_by_call[call.id] = [ProviderEvent("done", call.id, CallState.COMPLETED, "mock")]
+        self.assertEqual(engine.recover(), 1)
+        self.assertEqual(call.state, CallState.COMPLETED)
+        self.assertEqual(engine.agents[0].state.value, "available")
 
-    def test_circuit_breaker_opens_after_repeated_failures(self):
-        provider = MockTelecomProvider("mock", outcomes=[Outcome.FAILED, Outcome.FAILED])
+    def test_provider_outage_rejects_new_calls(self):
+        provider = MockTelecomProvider("mock")
+        provider.breaker.opened_until = 99
         engine = self.engine(providers=[provider])
-        engine.run_turn(self.leads(1), self.noon())
-        self.assertFalse(provider.breaker.available(engine.turn))
+        self.assertEqual(engine.run_turn(self.leads(2), self.noon()), [])
+        self.assertEqual(engine.safety.decisions[-1].reason, "no healthy provider")
+
+    def test_pacer_backs_off_on_bad_answer_rate(self):
+        self.assertEqual(PredictivePacer(ratio=3.5).update(0, .03, .1), 1)
+
+    def test_abandon_guard_falls_back_to_progressive(self):
+        safety = SafetyController(CampaignConfig(max_abandon_rate=.03))
+        request = type("Request", (), {"requested": 10, "available_agents": 3, "provider_healthy": True, "mode": "predictive"})()
+        self.assertEqual(safety.authorize(request, .03).approved, 3)
 
     def engine(self, mode="predictive", agents=4, cap=20, providers=None):
-        return DialerEngine(CampaignConfig(mode=mode, max_concurrent_calls=cap), [Agent(str(i)) for i in range(agents)], providers or [MockTelecomProvider("mock", outcomes=[Outcome.NO_ANSWER] * 100)])
+        return DialerEngine(CampaignConfig(mode=mode, max_concurrent_calls=cap), [Agent(str(i)) for i in range(agents)], providers or [MockTelecomProvider("mock", outcomes=[Outcome.NO_ANSWER] * 200)])
 
     def leads(self, count): return [Lead(str(i), f"+1{i}") for i in range(count)]
     def noon(self): return datetime(2026, 1, 1, 12)

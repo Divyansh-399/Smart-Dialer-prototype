@@ -1,71 +1,133 @@
 from collections import Counter
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Iterable
 
-from .models import Agent, CallRecord, CampaignConfig, Lead, Outcome
+from .models import (Agent, AgentState, CallRecord, CallState, CampaignConfig, Lead,
+                     Outcome, PacingRequest, ProviderEvent, TERMINAL_CALL_STATES)
 from .pacing import PredictivePacer
 from .providers import MockTelecomProvider
-from .safety import SafetyGuard
+from .repository import InMemoryRepository
+from .safety import SafetyController
 
 
 class DialerEngine:
+    """Campaign -> Pacer -> Safety Controller -> Allocator -> Provider."""
     def __init__(self, config: CampaignConfig, agents: Iterable[Agent], providers: Iterable[MockTelecomProvider]):
         self.config = config
-        self.agents = list(agents)
         self.providers = list(providers)
         if not self.providers:
             raise ValueError("At least one provider is required")
-        self.pacer = PredictivePacer()
-        self.guard = SafetyGuard(config)
+        self.repository = InMemoryRepository(list(agents))
+        self.pacer, self.safety = PredictivePacer(), SafetyController(config)
         self.records: list[CallRecord] = []
         self._reported_blocks: set[tuple[str, Outcome]] = set()
-        self.turn = 0
-        self.max_seen_concurrent = 0
+        self.turn, self.max_seen_concurrent = 0, 0
+
+    @property
+    def agents(self) -> list[Agent]:
+        return list(self.repository.agents.values())
 
     @property
     def abandon_rate(self) -> float:
-        completed = sum(r.outcome in {Outcome.ANSWERED, Outcome.ABANDONED} for r in self.records)
-        return sum(r.outcome == Outcome.ABANDONED for r in self.records) / completed if completed else 0.0
+        connected = sum(r.outcome == Outcome.ANSWERED for r in self.records)
+        abandoned = sum(r.outcome == Outcome.ABANDONED for r in self.records)
+        return abandoned / (connected + abandoned) if connected + abandoned else 0.0
+
+    @property
+    def answer_rate(self) -> float:
+        completed = [r for r in self.records if r.state in TERMINAL_CALL_STATES]
+        return sum(r.outcome == Outcome.ANSWERED for r in completed) / len(completed) if completed else .32
 
     def run_turn(self, leads: list[Lead], now: datetime | None = None) -> list[CallRecord]:
-        now = now or datetime.utcnow()
+        now = now or datetime.now(UTC)
         self.turn += 1
-        free_agents = sum(agent.available for agent in self.agents)
-        self.pacer.update(self.abandon_rate, self.config.max_abandon_rate)
-        desired = self.pacer.target(free_agents, self.config.mode, self.config.max_concurrent_calls)
-        target = self.guard.safe_target(desired, free_agents, self.abandon_rate)
-        selected = []
+        self.repository.add_leads(leads)
+        available = self.repository.available_agents()
+        healthy = any(provider.healthy(self.turn) for provider in self.providers)
+        self.pacer.update(self.abandon_rate, self.config.max_abandon_rate, self.answer_rate)
+        requested = self.pacer.target(available, self.config.mode, self.config.max_concurrent_calls)
+        decision = self.safety.authorize(PacingRequest(requested, self.config.mode, available, 0, healthy), self.abandon_rate)
+        selected: list[CallRecord] = []
         for lead in leads:
-            blocked = self.guard.eligibility(lead, now)
-            if blocked:
-                key = (lead.id, blocked)
-                if blocked in {Outcome.BLOCKED_DNC, Outcome.BLOCKED_HOURS} and key not in self._reported_blocks:
-                    self.records.append(CallRecord(lead.id, blocked))
-                    self._reported_blocks.add(key)
-                continue
-            selected.append(lead)
-            if len(selected) == target:
+            if len(selected) >= decision.approved:
                 break
+            blocked = self.safety.eligibility(lead, now)
+            if blocked:
+                self._report_block(lead, blocked)
+                continue
+            call = CallRecord(lead_id=lead.id)
+            if self.repository.reserve(lead.id, call):
+                lead.attempts += 1
+                selected.append(call)
         self.max_seen_concurrent = max(self.max_seen_concurrent, len(selected))
-        results = [self._call(lead, free_agents) for lead in selected]
-        self.records.extend(results)
-        return results
+        for call in selected:
+            self._initiate(call)
+        return selected
 
-    def _call(self, lead: Lead, free_agents: int) -> CallRecord:
-        lead.attempts += 1
-        for attempt in range(1, self.config.retry_limit + 2):
-            provider = self._provider()
-            outcome = provider.place_call(lead, self.turn)
-            if outcome != Outcome.FAILED:
-                if outcome == Outcome.ANSWERED and free_agents <= 0:
-                    outcome = Outcome.ABANDONED
-                return CallRecord(lead.id, outcome, provider.name, attempt)
-        return CallRecord(lead.id, Outcome.FAILED, self._provider().name, self.config.retry_limit + 1)
+    def _report_block(self, lead: Lead, outcome: Outcome) -> None:
+        key = (lead.id, outcome)
+        if outcome in {Outcome.BLOCKED_DNC, Outcome.BLOCKED_HOURS} and key not in self._reported_blocks:
+            self.records.append(CallRecord(lead.id, outcome=outcome, state=CallState.CANCELLED))
+            self._reported_blocks.add(key)
 
-    def _provider(self) -> MockTelecomProvider:
-        healthy = [p for p in self.providers if p.breaker.available(self.turn)]
-        return (healthy or self.providers)[0]
+    def _initiate(self, call: CallRecord) -> None:
+        provider = self._provider()
+        if provider is None:
+            call.state, call.outcome = CallState.FAILED, Outcome.FAILED
+            call.history.append(CallState.FAILED.value)
+            self.repository.release(call)
+            self.records.append(call)
+            return
+        call.provider, call.state, call.attempts = provider.name, CallState.INITIATED, 1
+        call.history.append(CallState.INITIATED.value)
+        self.repository.agents[call.agent_id].state = AgentState.DIALING
+        for event in provider.initiate(call, self.turn):
+            self.process_event(event)
+
+    def process_event(self, event: ProviderEvent) -> bool:
+        call = self.repository.calls.get(event.call_id)
+        if not call or event.id in call.event_ids or call.state in TERMINAL_CALL_STATES:
+            return False
+        call.event_ids.add(event.id)
+        if event.state == CallState.RINGING and call.state in {CallState.RESERVED, CallState.INITIATED}:
+            call.state = CallState.RINGING
+        elif event.state == CallState.ANSWERED and call.state in {CallState.INITIATED, CallState.RINGING}:
+            call.state, call.outcome = CallState.CONNECTED, Outcome.ANSWERED
+            self.repository.agents[call.agent_id].state = AgentState.CONNECTED
+        elif event.state == CallState.COMPLETED:
+            call.state = CallState.COMPLETED
+        elif event.state == CallState.FAILED:
+            call.state, call.outcome = CallState.FAILED, Outcome.FAILED
+        else:
+            return False
+        call.history.append(event.state.value)
+        if call.state in TERMINAL_CALL_STATES:
+            self.repository.release(call)
+            if call not in self.records:
+                self.records.append(call)
+        return True
+
+    def recover(self) -> int:
+        """Reconcile in-flight calls with the provider after a worker restart."""
+        recovered = 0
+        for call in list(self.repository.calls.values()):
+            if call.state in TERMINAL_CALL_STATES:
+                continue
+            provider = next((p for p in self.providers if p.name == call.provider), None)
+            for event in provider.status(call.id) if provider else []:
+                self.process_event(event)
+            if call.state not in TERMINAL_CALL_STATES:
+                call.state = CallState.CANCELLED
+                call.history.append("cancelled_after_recovery")
+                self.repository.release(call)
+                self.records.append(call)
+            recovered += 1
+        return recovered
+
+    def _provider(self) -> MockTelecomProvider | None:
+        return next((p for p in self.providers if p.healthy(self.turn)), None)
 
     def summary(self) -> dict[str, int | float]:
-        counts = Counter(r.outcome.value for r in self.records)
-        return {**counts, "abandon_rate": round(self.abandon_rate * 100, 2), "pacing_ratio": self.pacer.ratio}
+        counts = Counter(record.outcome.value for record in self.records)
+        return {**counts, "abandon_rate": round(self.abandon_rate * 100, 2), "pacing_ratio": self.pacer.ratio,
+                "safety_decisions": len(self.safety.decisions), "max_batch": self.max_seen_concurrent}

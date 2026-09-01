@@ -1,110 +1,43 @@
-# Relay Smart Dialer
+# CredResolve SmartDialer
 
-A safe, simulated Smart Dialer for demonstrating progressive and predictive dialing. It includes an interactive browser dashboard and a dependency-free Python simulation engine.
+A working, dependency-free SmartDialer prototype built for the Hiring 2026 assignment. It is intentionally a small, explainable design that prioritizes deterministic safety over raw dial volume. It does not place real calls or contain real customer data.
 
-> **Demo only:** this project never places real calls and contains no real customer data.
+## Run it
 
-## What it does
-
-A call centre normally has agents dial phone numbers manually. Relay automates the decision of who to call next, while making sure the call is safe to place.
-
-- **Progressive dialing** calls one customer only when an agent is free.
-- **Predictive dialing** carefully dials ahead to reduce agent waiting time.
-- **Safety controls** skip Do Not Call contacts, respect calling hours, cap repeat attempts, and reduce dialing if abandonment becomes unsafe.
-- **Provider resilience** uses mock telecom providers, retries temporary failures, and avoids an unhealthy provider with a circuit breaker.
-- **Visibility** shows queue, agents, safety status, provider health, and call activity in the browser dashboard.
-
-## Quick start
-
-### 1. Clone and enter the project
-
-```bash
-git clone <your-repository-url>
-cd relay-smart-dialer
-```
-
-### 2. Run the simulation
-
-No external Python packages are required.
-
-```bash
-python -m smartdialer.simulation --mode predictive --leads 300 --agents 8
-```
-
-Try safe progressive mode:
-
-```bash
-python -m smartdialer.simulation --mode progressive --leads 100 --agents 4
-```
-
-### 3. Run the automated tests
+Requires Python 3.10+.
 
 ```bash
 python -m unittest discover -s tests -v
+python -m smartdialer.simulation --mode progressive --scenario A --leads 100 --agents 4
+python -m smartdialer.simulation --mode predictive --scenario C --leads 300 --agents 8
+python scripts/load_test.py
 ```
 
-### 4. Open the dashboard
+The optional static visual demo remains available by opening [index.html](index.html) in a browser.
 
-Open `index.html` in a modern web browser. Click **Run next call** to advance the UI simulation.
+## Assignment checklist
 
-## Project structure
+- Progressive and predictive pacing modes
+- A separate Safety Controller that alone authorizes allocation
+- Explicit agent and call state machines
+- Atomic agent + borrower reservation using a repository lock
+- Idempotent provider event processing and terminal-state protection
+- Reliable Provider A and duplicate/out-of-order Provider B mocks
+- Circuit breaker provider isolation, restart recovery, simulations, tests, and a load smoke test
+- Architecture decisions and scale plan in [docs/architecture.md](docs/architecture.md)
+
+## Safety boundary
 
 ```text
-relay-smart-dialer/
-├── index.html                 # Interactive dashboard
-├── styles.css                 # Dashboard styling
-├── app.js                     # Browser-only call simulation
-├── smartdialer/
-│   ├── models.py              # Lead, agent, call record, campaign settings
-│   ├── engine.py              # Campaign loop, concurrency and retries
-│   ├── pacing.py              # Predictive dial-ahead controller
-│   ├── safety.py              # DNC, hours, attempt and abandon safeguards
-│   ├── providers.py           # Mock telecom providers
-│   ├── circuit_breaker.py     # Provider health isolation
-│   └── simulation.py          # Command-line demo
-├── tests/
-│   └── test_smartdialer.py    # Automated checks
-├── pyproject.toml             # Installable package metadata
-├── LICENSE
-└── README.md
+Campaign -> Pacing Engine -> Safety Controller -> Call Allocator -> Telecom Provider
 ```
 
-## How the engine works
+The pacer only produces a requested count. It has no provider reference. The Safety Controller can approve, reduce, reject, or force progressive fallback. In this prototype every initiated call holds a real agent reservation (a connection token), so predictive requests above protected capacity are reduced. This sacrifices aggressive oversubscription while making the no-abandon invariant deterministic.
 
-```text
-Leads → safety check → pacing decision → concurrency cap → mock provider
-          ↓                    ↓                                ↓
-   DNC / hours / cap      progressive or              success, retry, or
-     blocks call           predictive target             provider failover
-```
+## Design notes
 
-The engine uses a safe fallback: if the abandon rate reaches the configured limit, it returns to progressive pacing instead of stopping forever. That allows the campaign to recover with lower-risk calls.
+The in-memory repository is the source of truth for the prototype. Its lock makes the borrower + agent reservation one atomic operation, so two worker threads cannot allocate the same agent or lead. Production would preserve that exact invariant with a database transaction / conditional update and a unique active-reservation constraint; a cache would never override the database.
 
-## Verification
+Provider events carry an event ID. Duplicate event IDs are ignored; once a call is terminal, later events are ignored. A restart calls the provider's status endpoint before cancelling a still-unknown reservation. The mock simulates that reconciliation path.
 
-The standard-library test suite covers:
-
-- DNC and calling-hours blocking
-- maximum calls per lead
-- progressive pacing
-- predictive pace adjustment
-- concurrency limits
-- provider retries and circuit breaker behaviour
-- emergency-brake fallback
-
-## Optional installation
-
-To install the simulation command locally:
-
-```bash
-python -m pip install -e .
-smartdialer-sim --mode predictive --leads 300 --agents 8
-```
-
-## Interview summary
-
-> “I built a Smart Dialer prototype that simulates automated call-centre dialing. It supports safe progressive dialing and more efficient predictive dialing. Before any call, it enforces Do Not Call rules, approved calling hours, retry limits, agent capacity, and an abandonment-rate safety guard. It also handles provider failures through retries and fallback routing. The project includes a browser dashboard, a runnable simulation, and automated tests.”
-
-## License
-
-Released under the [MIT License](LICENSE).
+See [docs/architecture.md](docs/architecture.md) for the diagrams, failure walkthroughs, pacing explanation, scaling plan, and the short answer requested in the brief.
