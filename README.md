@@ -41,3 +41,4 @@ The in-memory repository is the source of truth for the prototype. Its lock make
 Provider events carry an event ID. Duplicate event IDs are ignored; once a call is terminal, later events are ignored. A restart calls the provider's status endpoint before cancelling a still-unknown reservation. The mock simulates that reconciliation path.
 
 See [docs/architecture.md](docs/architecture.md) for the diagrams, failure walkthroughs, pacing explanation, scaling plan, and the short answer requested in the brief.
+For a direct checklist-to-file mapping for reviewers, see [docs/submission_answers.md](docs/submission_answers.md).
